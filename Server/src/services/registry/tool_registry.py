@@ -6,6 +6,36 @@ from typing import Callable, Any
 # Global registry to collect decorated tools
 _tool_registry: list[dict[str, Any]] = []
 
+# Tool filtering state
+_enabled_tools: set[str] | None = None  # None = all enabled (default)
+_disabled_tools: set[str] = set()
+
+
+def set_enabled_tools(tools: set[str] | None) -> None:
+    """Set allowlist of enabled tools (None = all enabled)."""
+    global _enabled_tools
+    _enabled_tools = tools
+
+
+def set_disabled_tools(tools: set[str]) -> None:
+    """Set blocklist of disabled tools."""
+    global _disabled_tools
+    _disabled_tools = tools
+
+
+def is_tool_enabled(tool_name: str) -> bool:
+    """Check if a tool should be registered based on current filters."""
+    if tool_name in _disabled_tools:
+        return False
+    if _enabled_tools is not None:
+        return tool_name in _enabled_tools
+    return True
+
+
+def get_all_tool_names() -> list[str]:
+    """Get names of all registered (unfiltered) tools."""
+    return [t['name'] for t in _tool_registry]
+
 
 def mcp_for_unity_tool(
     name: str | None = None,

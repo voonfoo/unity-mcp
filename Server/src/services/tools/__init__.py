@@ -9,7 +9,7 @@ from fastmcp import Context, FastMCP
 from core.telemetry_decorator import telemetry_tool
 from core.logging_decorator import log_execution
 from utils.module_discovery import discover_modules
-from services.registry import get_registered_tools
+from services.registry import get_registered_tools, is_tool_enabled
 
 logger = logging.getLogger("mcp-for-unity-server")
 
@@ -40,11 +40,20 @@ def register_all_tools(mcp: FastMCP):
         logger.warning("No MCP tools registered!")
         return
 
+    registered_count = 0
+    skipped_count = 0
+
     for tool_info in tools:
         func = tool_info['func']
         tool_name = tool_info['name']
         description = tool_info['description']
         kwargs = tool_info['kwargs']
+
+        # Apply filter
+        if not is_tool_enabled(tool_name):
+            logger.debug(f"Skipping disabled tool: {tool_name}")
+            skipped_count += 1
+            continue
 
         # Apply the @mcp.tool decorator, telemetry, and logging
         wrapped = log_execution(tool_name, "Tool")(func)
@@ -53,8 +62,12 @@ def register_all_tools(mcp: FastMCP):
             name=tool_name, description=description, **kwargs)(wrapped)
         tool_info['func'] = wrapped
         logger.debug(f"Registered tool: {tool_name} - {description}")
+        registered_count += 1
 
-    logger.info(f"Registered {len(tools)} MCP tools")
+    if skipped_count > 0:
+        logger.info(f"Registered {registered_count} MCP tools ({skipped_count} filtered out)")
+    else:
+        logger.info(f"Registered {registered_count} MCP tools")
 
 
 def get_unity_instance_from_context(
