@@ -6,25 +6,55 @@ from typing import Callable, Any
 # Global registry to collect decorated tools
 _tool_registry: list[dict[str, Any]] = []
 
-# Tool filtering state
-_enabled_tools: set[str] | None = None  # None = all enabled (default)
-_disabled_tools: set[str] = set()
+# Runtime tool filter state
+_enabled_tools: set[str] | None = None  # None = no filter, all tools enabled
+_disabled_tools: set[str] = set()  # Explicitly disabled tools
 
 
 def set_enabled_tools(tools: set[str] | None) -> None:
-    """Set allowlist of enabled tools (None = all enabled)."""
+    """Set the enabled tools filter.
+
+    Args:
+        tools: Set of tool names to enable. If None, all tools are enabled.
+    """
     global _enabled_tools
     _enabled_tools = tools
 
 
 def set_disabled_tools(tools: set[str]) -> None:
-    """Set blocklist of disabled tools."""
+    """Set the disabled tools filter.
+
+    Args:
+        tools: Set of tool names to disable.
+    """
     global _disabled_tools
     _disabled_tools = tools
 
 
+def get_enabled_tools() -> set[str] | None:
+    """Get the current enabled tools set."""
+    return _enabled_tools
+
+
+def get_disabled_tools() -> set[str]:
+    """Get the current disabled tools set."""
+    return _disabled_tools
+
+
+def clear_tool_filters() -> None:
+    """Clear all tool filters (called when Unity disconnects)."""
+    global _enabled_tools, _disabled_tools
+    _enabled_tools = None
+    _disabled_tools = set()
+
+
 def is_tool_enabled(tool_name: str) -> bool:
-    """Check if a tool should be registered based on current filters."""
+    """Check if a tool should be enabled based on current filters.
+
+    Returns True if:
+    - Tool is not in the disabled set, AND
+    - Either no enabled filter is set, OR the tool is in the enabled set
+    """
     if tool_name in _disabled_tools:
         return False
     if _enabled_tools is not None:

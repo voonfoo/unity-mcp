@@ -7,12 +7,15 @@ import logging
 import os
 import time
 import uuid
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from starlette.endpoints import WebSocketEndpoint
 from starlette.websockets import WebSocket
 
 from core.config import config
+
+if TYPE_CHECKING:
+    from fastmcp import FastMCP
 from models.models import MCPResponse
 from transport.plugin_registry import PluginRegistry
 from transport.models import (
@@ -60,15 +63,18 @@ class PluginHub(WebSocketEndpoint):
     _pending: dict[str, dict[str, Any]] = {}
     _lock: asyncio.Lock | None = None
     _loop: asyncio.AbstractEventLoop | None = None
+    _mcp: "FastMCP | None" = None
 
     @classmethod
     def configure(
         cls,
         registry: PluginRegistry,
         loop: asyncio.AbstractEventLoop | None = None,
+        mcp: "FastMCP | None" = None,
     ) -> None:
         cls._registry = registry
         cls._loop = loop or asyncio.get_running_loop()
+        cls._mcp = mcp
         # Ensure coordination primitives are bound to the configured loop
         cls._lock = asyncio.Lock()
 
@@ -78,6 +84,7 @@ class PluginHub(WebSocketEndpoint):
 
     async def on_connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
+        logger.info("[WebSocket] New connection accepted, sending welcome message")
         msg = WelcomeMessage(
             serverTimeout=self.SERVER_TIMEOUT,
             keepAliveInterval=self.KEEP_ALIVE_INTERVAL,
@@ -90,6 +97,7 @@ class PluginHub(WebSocketEndpoint):
             return
 
         message_type = data.get("type")
+        logger.info(f"[WebSocket] Received message type: {message_type}")
         try:
             if message_type == "register":
                 await self._handle_register(websocket, RegisterMessage(**data))
@@ -132,6 +140,16 @@ class PluginHub(WebSocketEndpoint):
                         )
                 if cls._registry:
                     await cls._registry.unregister(session_id)
+
+                    # If no more sessions, clear tool filters and restore full tool list
+                    remaining = await cls._registry.list_sessions()
+                    if len(remaining) == 0:
+                        from services.registry import clear_tool_filters
+                        clear_tool_filters()
+                        await cls._restore_all_tools()
+                        await cls._send_tools_list_changed()
+                        logger.info("All Unity sessions disconnected, restored full tool list")
+
                 logger.info(
                     f"Plugin session {session_id} disconnected ({close_code})")
 
@@ -296,10 +314,12 @@ class PluginHub(WebSocketEndpoint):
         logger.info(f"Plugin registered: {project_name} ({project_hash})")
 
     async def _handle_register_tools(self, websocket: WebSocket, payload: RegisterToolsMessage) -> None:
+        logger.info(f"[RegisterTools] Starting _handle_register_tools with {len(payload.tools)} tools")
         cls = type(self)
         registry = cls._registry
         lock = cls._lock
         if registry is None or lock is None:
+            logger.warning("[RegisterTools] Registry or lock is None, returning early")
             return
 
         # Find session_id for this websocket
@@ -311,9 +331,41 @@ class PluginHub(WebSocketEndpoint):
             logger.warning("Received register_tools from unknown connection")
             return
 
+        logger.info(f"[RegisterTools] Found session_id: {session_id}")
+
+        # Extract enabled tool names from Unity's selection
+        enabled_tool_names = {tool.name for tool in payload.tools}
+        logger.info(f"[RegisterTools] Unity enabled tools: {enabled_tool_names}")
+
+        # Update the tool filters
+        from services.registry import set_enabled_tools, set_disabled_tools, get_all_tool_names
+        all_tools = set(get_all_tool_names())
+        disabled_tool_names = all_tools - enabled_tool_names
+
+        set_enabled_tools(enabled_tool_names)
+        set_disabled_tools(disabled_tool_names)
+        logger.info("[RegisterTools] Set tool filters")
+
+        # Store tools in registry (existing behavior)
         await registry.register_tools_for_session(session_id, payload.tools)
+        logger.info("[RegisterTools] Stored tools in registry")
+
+        # Update FastMCP's tool manager to hide disabled tools from MCP clients
+        logger.info(f"[RegisterTools] All tools: {len(all_tools)}, Disabled: {len(disabled_tool_names)}")
+        logger.info(f"[RegisterTools] About to call _update_fastmcp_tools...")
+        await cls._update_fastmcp_tools(enabled_tool_names, disabled_tool_names)
+        logger.info("[RegisterTools] Finished _update_fastmcp_tools")
+
+        # Notify MCP clients that the tool list has changed
+        await cls._send_tools_list_changed()
+
+        # Log enabled/disabled tools
         logger.info(
-            f"Registered {len(payload.tools)} tools for session {session_id}")
+            f"Unity session {session_id}: {len(enabled_tool_names)}/{len(all_tools)} tools enabled")
+        if enabled_tool_names:
+            logger.info(f"  Enabled tools: {sorted(enabled_tool_names)}")
+        if disabled_tool_names:
+            logger.info(f"  Disabled tools: {sorted(disabled_tool_names)}")
 
     async def _handle_command_result(self, payload: CommandResultMessage) -> None:
         cls = type(self)
@@ -352,6 +404,108 @@ class PluginHub(WebSocketEndpoint):
         if websocket is None:
             raise RuntimeError(f"Plugin session {session_id} not connected")
         return websocket
+
+    # Storage for disabled tools so we can restore them later
+    _disabled_tool_backup: dict[str, Any] = {}
+
+    @classmethod
+    async def _update_fastmcp_tools(cls, enabled_tools: set[str], disabled_tools: set[str]) -> None:
+        """Update FastMCP's tool manager to hide/show tools based on Unity's selection.
+
+        This directly modifies FastMCP's internal tool registry so disabled tools
+        don't appear in the MCP tools/list response.
+        """
+        try:
+            mcp = cls._mcp
+            if mcp is None:
+                logger.warning("[ToolFilter] FastMCP instance not configured")
+                return
+
+            logger.info(f"[ToolFilter] Attempting to update FastMCP tools...")
+            logger.info(f"[ToolFilter] mcp type: {type(mcp)}, has _tool_manager: {hasattr(mcp, '_tool_manager')}")
+
+            if not hasattr(mcp, '_tool_manager') or mcp._tool_manager is None:
+                logger.warning("[ToolFilter] FastMCP tool manager not available")
+                return
+
+            tool_manager = mcp._tool_manager
+            logger.info(f"[ToolFilter] tool_manager type: {type(tool_manager)}, has _tools: {hasattr(tool_manager, '_tools')}")
+
+            if not hasattr(tool_manager, '_tools'):
+                logger.warning("[ToolFilter] FastMCP tool manager has no _tools attribute")
+                return
+
+            logger.info(f"[ToolFilter] Current tools in manager: {list(tool_manager._tools.keys())}")
+
+            # Restore any previously disabled tools first
+            for tool_name, tool in cls._disabled_tool_backup.items():
+                if tool_name not in tool_manager._tools:
+                    tool_manager._tools[tool_name] = tool
+                    logger.debug(f"[ToolFilter] Restored tool: {tool_name}")
+
+            cls._disabled_tool_backup.clear()
+
+            # Now remove the newly disabled tools
+            removed_count = 0
+            for tool_name in disabled_tools:
+                if tool_name in tool_manager._tools:
+                    cls._disabled_tool_backup[tool_name] = tool_manager._tools.pop(tool_name)
+                    removed_count += 1
+                    logger.debug(f"[ToolFilter] Removed tool from MCP list: {tool_name}")
+
+            logger.info(f"[ToolFilter] Removed {removed_count} tools, {len(tool_manager._tools)} tools now visible")
+            logger.info(f"[ToolFilter] Visible tools: {list(tool_manager._tools.keys())}")
+
+        except Exception as e:
+            logger.warning(f"[ToolFilter] Could not update FastMCP tools: {e}", exc_info=True)
+
+    @classmethod
+    async def _restore_all_tools(cls) -> None:
+        """Restore all disabled tools when Unity disconnects."""
+        try:
+            mcp = cls._mcp
+            if mcp is None:
+                return
+
+            if not hasattr(mcp, '_tool_manager') or mcp._tool_manager is None:
+                return
+
+            tool_manager = mcp._tool_manager
+            if not hasattr(tool_manager, '_tools'):
+                return
+
+            # Restore all backed up tools
+            for tool_name, tool in cls._disabled_tool_backup.items():
+                if tool_name not in tool_manager._tools:
+                    tool_manager._tools[tool_name] = tool
+                    logger.debug(f"Restored tool: {tool_name}")
+
+            cls._disabled_tool_backup.clear()
+            logger.info(f"Restored all tools: {len(tool_manager._tools)} tools visible")
+
+        except Exception as e:
+            logger.warning(f"Could not restore FastMCP tools: {e}")
+
+    @classmethod
+    async def _send_tools_list_changed(cls) -> None:
+        """Send tools/list_changed notification to MCP clients.
+
+        This notifies clients that the available tool list has changed
+        so they can re-fetch the tool list.
+        """
+        try:
+            mcp = cls._mcp
+            if mcp is None:
+                return
+            # FastMCP exposes the low-level MCP server for notifications
+            if hasattr(mcp, '_mcp_server') and mcp._mcp_server is not None:
+                await mcp._mcp_server.request_context.session.send_notification(
+                    "notifications/tools/list_changed", {}
+                )
+                logger.debug("Sent tools/list_changed notification")
+        except Exception as e:
+            # Notification is best-effort; don't fail if it doesn't work
+            logger.debug(f"Could not send tools/list_changed notification: {e}")
 
     # ------------------------------------------------------------------
     # Session resolution helpers

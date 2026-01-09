@@ -62,6 +62,13 @@ logging.basicConfig(
     force=True    # Ensure our handler replaces any prior stdout handlers
 )
 logger = logging.getLogger("mcp-for-unity-server")
+logger.setLevel(getattr(logging, config.log_level))
+
+# Add console handler so logs appear in terminal
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(getattr(logging, config.log_level))
+_console_handler.setFormatter(logging.Formatter(config.log_format))
+logger.addHandler(_console_handler)
 
 # Also write logs to a rotating file so logs are available when launched via stdio
 try:
@@ -106,23 +113,6 @@ try:
 except Exception:
     pass
 
-# Configure tool filtering from environment variables
-# This must happen before register_all_tools() is called
-from services.registry import set_enabled_tools, set_disabled_tools
-_enable_tools_env = os.environ.get("UNITY_MCP_ENABLE_TOOLS", "").strip()
-_disable_tools_env = os.environ.get("UNITY_MCP_DISABLE_TOOLS", "").strip()
-if _enable_tools_env and _disable_tools_env:
-    logger.warning("Both UNITY_MCP_ENABLE_TOOLS and UNITY_MCP_DISABLE_TOOLS are set; using ENABLE_TOOLS (allowlist)")
-    _disable_tools_env = ""
-if _enable_tools_env:
-    _enabled_set = {t.strip() for t in _enable_tools_env.split(",") if t.strip()}
-    set_enabled_tools(_enabled_set)
-    logger.info(f"Tool allowlist from env: {sorted(_enabled_set)}")
-elif _disable_tools_env:
-    _disabled_set = {t.strip() for t in _disable_tools_env.split(",") if t.strip()}
-    set_disabled_tools(_disabled_set)
-    logger.info(f"Tool blocklist from env: {sorted(_disabled_set)}")
-
 # Global connection pool
 _unity_connection_pool: UnityConnectionPool | None = None
 _plugin_registry: PluginRegistry | None = None
@@ -154,7 +144,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
     if _plugin_registry is None:
         _plugin_registry = PluginRegistry()
         loop = asyncio.get_running_loop()
-        PluginHub.configure(_plugin_registry, loop)
+        PluginHub.configure(_plugin_registry, loop, mcp=server)
 
     # Record server startup telemetry
     start_time = time.time()
@@ -340,7 +330,6 @@ register_all_tools(mcp)
 # Register all resources
 register_all_resources(mcp)
 
-
 def main():
     """Entry point for uvx and console scripts."""
     parser = argparse.ArgumentParser(
@@ -355,8 +344,6 @@ Environment Variables:
   UNITY_MCP_HTTP_URL   HTTP server URL (default: http://localhost:8080)
   UNITY_MCP_HTTP_HOST   HTTP server host (overrides URL host)
   UNITY_MCP_HTTP_PORT   HTTP server port (overrides URL port)
-  UNITY_MCP_ENABLE_TOOLS   Comma-separated allowlist of tools to enable
-  UNITY_MCP_DISABLE_TOOLS   Comma-separated blocklist of tools to disable
 
 Examples:
   # Use specific Unity project as default
@@ -371,14 +358,12 @@ Examples:
   # Use environment variable for transport
   UNITY_MCP_TRANSPORT=http UNITY_MCP_HTTP_URL=http://localhost:9000 python -m src.server
 
-  # Enable only specific tools (allowlist mode, via env var)
-  UNITY_MCP_ENABLE_TOOLS=manage_asset,manage_scene,read_console python -m src.server
-
-  # Disable specific tools (blocklist mode, via env var)
-  UNITY_MCP_DISABLE_TOOLS=manage_vfx,manage_shader python -m src.server
-
   # List all available tools
   python -m src.server --list-tools
+
+Tool Filtering:
+  Tools can be enabled/disabled from Unity Editor's MCP window (Tools tab).
+  When Unity connects, only enabled tools will be available to MCP clients.
         """
     )
     parser.add_argument(
@@ -454,12 +439,6 @@ Examples:
         print(f"\nTotal: {len(tool_names)} tools")
         import sys
         sys.exit(0)
-
-    # Log active tool filtering (already applied at module load from env vars)
-    if _enable_tools_env:
-        logger.info(f"Tool allowlist active: {len(_enabled_set)} tools enabled")
-    elif _disable_tools_env:
-        logger.info(f"Tool blocklist active: {len(_disabled_set)} tools disabled")
 
     # Set environment variables from command line args
     if args.default_instance:

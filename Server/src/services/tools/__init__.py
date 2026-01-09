@@ -1,5 +1,7 @@
 """MCP tools package - auto-discovery and Unity routing helpers."""
 
+import functools
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -20,12 +22,46 @@ __all__ = [
 ]
 
 
+def _create_guarded_tool(func, tool_name: str):
+    """Create a wrapper that checks if the tool is enabled before execution.
+
+    If the tool is disabled by Unity's selection, returns an error
+    instead of executing the tool.
+    """
+    if inspect.iscoroutinefunction(func):
+        @functools.wraps(func)
+        async def async_guarded(*args, **kwargs):
+            if not is_tool_enabled(tool_name):
+                return {
+                    "error": f"Tool '{tool_name}' is currently disabled. "
+                             "Enable it in Unity Editor's MCP window (Tools tab).",
+                    "disabled": True
+                }
+            return await func(*args, **kwargs)
+        return async_guarded
+    else:
+        @functools.wraps(func)
+        def sync_guarded(*args, **kwargs):
+            if not is_tool_enabled(tool_name):
+                return {
+                    "error": f"Tool '{tool_name}' is currently disabled. "
+                             "Enable it in Unity Editor's MCP window (Tools tab).",
+                    "disabled": True
+                }
+            return func(*args, **kwargs)
+        return sync_guarded
+
+
 def register_all_tools(mcp: FastMCP):
     """
     Auto-discover and register all tools in the tools/ directory.
 
     Any .py file in this directory or subdirectories with @mcp_for_unity_tool decorated
     functions will be automatically registered.
+
+    All tools are registered with FastMCP, but each tool has a guard that checks
+    is_tool_enabled() at runtime. This allows Unity to dynamically enable/disable
+    tools without restarting the server.
     """
     logger.info("Auto-discovering MCP for Unity Server tools...")
     # Dynamic import of all modules in this directory
@@ -40,34 +76,24 @@ def register_all_tools(mcp: FastMCP):
         logger.warning("No MCP tools registered!")
         return
 
-    registered_count = 0
-    skipped_count = 0
-
     for tool_info in tools:
         func = tool_info['func']
         tool_name = tool_info['name']
         description = tool_info['description']
         kwargs = tool_info['kwargs']
 
-        # Apply filter
-        if not is_tool_enabled(tool_name):
-            logger.debug(f"Skipping disabled tool: {tool_name}")
-            skipped_count += 1
-            continue
+        # Wrap with guard that checks is_tool_enabled() at runtime
+        guarded = _create_guarded_tool(func, tool_name)
 
         # Apply the @mcp.tool decorator, telemetry, and logging
-        wrapped = log_execution(tool_name, "Tool")(func)
+        wrapped = log_execution(tool_name, "Tool")(guarded)
         wrapped = telemetry_tool(tool_name)(wrapped)
         wrapped = mcp.tool(
             name=tool_name, description=description, **kwargs)(wrapped)
         tool_info['func'] = wrapped
         logger.debug(f"Registered tool: {tool_name} - {description}")
-        registered_count += 1
 
-    if skipped_count > 0:
-        logger.info(f"Registered {registered_count} MCP tools ({skipped_count} filtered out)")
-    else:
-        logger.info(f"Registered {registered_count} MCP tools")
+    logger.info(f"Registered {len(tools)} MCP tools (runtime filtering enabled)")
 
 
 def get_unity_instance_from_context(
